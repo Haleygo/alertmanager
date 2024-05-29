@@ -17,13 +17,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 
 	"github.com/prometheus/alertmanager/api/v2/client/alert"
+	"github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/alertmanager/cli/format"
 	"github.com/prometheus/alertmanager/matchers/compat"
+	"github.com/prometheus/alertmanager/pkg/labels"
 )
 
 type alertQueryCmd struct {
@@ -107,9 +111,94 @@ func (a *alertQueryCmd) queryAlerts(ctx context.Context, _ *kingpin.ParseContext
 		return err
 	}
 
+	psils, err := amclient.Silence.GetSilences(nil)
+	if err != nil {
+		return fmt.Errorf("error when list silences: %v", err)
+	}
+	silenceMap := make(map[string]*models.GettableSilence)
+	silenceMatcherMap := make(map[string][]*labels.Matcher)
+	for _, sil := range psils.Payload {
+		if *sil.Status.State != "expired" {
+			continue
+		}
+		silenceMap[*sil.ID] = sil
+		ms := make([]*labels.Matcher, 0, len(sil.Matchers))
+		for _, v := range sil.Matchers {
+			var tt labels.MatchType
+			if v.IsEqual != nil {
+				if *v.IsEqual {
+					if *v.IsRegex {
+						tt = labels.MatchRegexp
+					} else {
+						tt = labels.MatchEqual
+					}
+				} else {
+					if *v.IsRegex {
+						tt = labels.MatchNotRegexp
+					} else {
+						tt = labels.MatchNotEqual
+					}
+				}
+			}
+			nm, err := labels.NewMatcher(tt, *v.Name, *v.Value)
+			if err != nil {
+				return fmt.Errorf("failed to new matcher: %v", err)
+			}
+			ms = append(ms, nm)
+		}
+		silenceMatcherMap[*sil.ID] = ms
+	}
+
+	for _, alert := range getOk.Payload {
+		sms := make(map[string]string)
+		for k, v := range alert.Alert.Labels {
+			sms[k] = string(v)
+		}
+
+		var matches []*models.GettableSilence
+		for id, ms := range silenceMatcherMap {
+			if matchFilterLabels(ms, sms) {
+				matches = append(matches, silenceMap[id])
+			}
+		}
+		sort.Slice(matches, func(i, j int) bool {
+			return time.Time(*matches[i].StartsAt).After(time.Time(*matches[j].StartsAt))
+		})
+
+		for i, sil := range matches {
+			alert.Labels[fmt.Sprintf("silenceID-%d", i)] = fmt.Sprintf("%s/#/silences/%s", alertmanagerURL.String(), *sil.ID)
+		}
+		alert.Annotations = nil
+		alert.GeneratorURL = ""
+	}
+
 	formatter, found := format.Formatters[output]
 	if !found {
 		return errors.New("unknown output formatter")
 	}
 	return formatter.FormatAlerts(getOk.Payload)
+}
+
+func matchFilterLabels(matchers []*labels.Matcher, sms map[string]string) bool {
+	for _, m := range matchers {
+		v, prs := sms[m.Name]
+		switch m.Type {
+		case labels.MatchNotRegexp, labels.MatchNotEqual:
+			if m.Value == "" && prs {
+				continue
+			}
+			if !m.Matches(v) {
+				return false
+			}
+		default:
+			if m.Value == "" && !prs {
+				continue
+			}
+			if !m.Matches(v) {
+				return false
+			}
+		}
+	}
+
+	return true
 }
